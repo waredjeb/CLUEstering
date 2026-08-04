@@ -64,18 +64,37 @@ namespace clue::detail {
             dev_tiles.searchBox(searchbox_extremes, searchbox_bins);
 
             std::array<int32_t, Ndim> base_vec;
-            for_recursion<TAcc, Ndim, Ndim>(acc,
-                                            base_vec,
-                                            searchbox_bins,
-                                            dev_tiles,
-                                            dev_points,
-                                            kernel,
-                                            coords_i,
-                                            rho_i,
-                                            density_radius,
-                                            metric,
-                                            global_idx,
-                                            event);
+            if constexpr (clue::is_window2x2_kernel<std::remove_cvref_t<KernelType>>) {
+              std::array<TData, 4> quads{TData{0}, TData{0}, TData{0}, TData{0}};
+              for_recursion_2x2<TAcc, Ndim, Ndim>(acc,
+                                                  base_vec,
+                                                  searchbox_bins,
+                                                  dev_tiles,
+                                                  dev_points,
+                                                  kernel,
+                                                  coords_i,
+                                                  quads,
+                                                  density_radius,
+                                                  metric,
+                                                  global_idx,
+                                                  event);
+              const auto nmax =
+                  math::max(math::max(quads[0], quads[1]), math::max(quads[2], quads[3]));
+              rho_i = dev_points.weights()[global_idx] + nmax;
+            } else {
+              for_recursion<TAcc, Ndim, Ndim>(acc,
+                                              base_vec,
+                                              searchbox_bins,
+                                              dev_tiles,
+                                              dev_points,
+                                              kernel,
+                                              coords_i,
+                                              rho_i,
+                                              density_radius,
+                                              metric,
+                                              global_idx,
+                                              event);
+            }
 
             assert(rho_i >= TData{0});
             dev_points.rho()[global_idx] = rho_i;

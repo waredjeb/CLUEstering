@@ -113,6 +113,38 @@ namespace clue {
                                        int j) const;
   };
 
+  /// @brief Tag kernel selecting the HGCAL scintillator "2x2 window" density.
+  /// Instead of summing all neighbours within the radius, the density becomes
+  ///   rho_i = w_i + max over the four (dim0,dim1) sign-quadrants of the
+  ///           per-neighbour contributions (m_flat * w_j).
+  /// This reproduces HGCalCLUEAlgo's use2x2 scintillator local density. The
+  /// density code dispatches on this type (see clue::is_window2x2_kernel); its
+  /// operator() returns the flat per-neighbour weight used inside the quadrants.
+  template <std::floating_point TData = float>
+  class Window2x2Kernel {
+  public:
+    using value_type = std::remove_cv_t<std::remove_reference_t<TData>>;
+
+  private:
+    value_type m_flat;
+
+  public:
+    ALPAKA_FN_HOST_ACC Window2x2Kernel(value_type flat = value_type{0.5}) : m_flat{flat} {}
+
+    template <typename TAcc>
+    ALPAKA_FN_HOST_ACC value_type operator()(const TAcc& /*acc*/,
+                                             value_type /*dist_ij*/,
+                                             int /*point_id*/,
+                                             int /*j*/) const {
+      return m_flat;
+    }
+  };
+
+  template <typename K>
+  inline constexpr bool is_window2x2_kernel = false;
+  template <std::floating_point T>
+  inline constexpr bool is_window2x2_kernel<Window2x2Kernel<T>> = true;
+
   namespace concepts {
 
     /// @brief Concept describing a convolutional kernel

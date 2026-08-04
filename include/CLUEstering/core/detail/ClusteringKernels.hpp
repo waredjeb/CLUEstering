@@ -18,9 +18,11 @@
 #include <alpaka/alpaka.hpp>
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace clue::detail {
 
@@ -88,6 +90,96 @@ namespace clue::detail {
     }
   }
 
+  // Accumulate the four (dim0, dim1) sign-quadrant neighbour sums used by the
+  // "2x2 window" density (HGCalCLUEAlgo scintillator recipe). dim1 is treated as
+  // periodic with period 2*pi (the scintillator phi coordinate). The point
+  // itself is skipped; the caller adds w_i and takes max(quads).
+  template <typename TAcc,
+            std::size_t Ndim,
+            std::size_t N_,
+            std::floating_point TData,
+            concepts::convolutional_kernel KernelType,
+            concepts::distance_metric<Ndim> DistanceMetric,
+            std::floating_point TPointsData = TData>
+    requires(Ndim == 2 && std::same_as<std::remove_cv_t<TPointsData>, std::remove_cv_t<TData>>)
+  ALPAKA_FN_ACC void for_recursion_2x2(const TAcc& acc,
+                                       std::array<int32_t, Ndim>& base_vec,
+                                       const clue::SearchBoxBins<Ndim>& search_box,
+                                       internal::TilesView<Ndim, TData>& tiles,
+                                       PointsView<Ndim, TPointsData>& dev_points,
+                                       const KernelType& kernel,
+                                       const std::array<TData, Ndim + 1>& coords_i,
+                                       std::array<TData, 4>& quads,
+                                       TData density_radius,
+                                       const DistanceMetric& metric,
+                                       int32_t point_id,
+                                       std::size_t event = 0) {
+    if constexpr (N_ == 0) {
+      auto tile_idx = tiles.getGlobalBinByBin(base_vec, event);
+      auto tile_size = tiles[tile_idx].size();
+
+      for (auto tile_it = 0u; tile_it < tile_size; ++tile_it) {
+        auto j = tiles[tile_idx][tile_it];
+        assert(j >= 0 && j < dev_points.size());
+        if (j == point_id)
+          continue;  // self weight is added by the caller
+
+        const auto distance = [&]() -> TData {
+          if constexpr (concepts::detail::view_distance_metric<DistanceMetric, Ndim>) {
+            return metric(
+                dev_points, static_cast<std::size_t>(point_id), static_cast<std::size_t>(j));
+          } else {
+            return metric(coords_i, dev_points[j]);
+          }
+        }();
+        assert(distance >= TData{0});
+
+        // Strict '<' to match HGCalCLUEAlgo's scintillator local density.
+        if (distance < density_radius) {
+          const auto c = kernel(acc, distance, point_id, j) * dev_points.weights()[j];
+          const auto coords_j = dev_points[j];
+          const auto d_eta = coords_j[0] - coords_i[0];
+          auto d_phi = coords_j[1] - coords_i[1];
+          constexpr auto pi = static_cast<TData>(M_PI);
+          constexpr auto twopi = static_cast<TData>(2) * pi;
+          if (d_phi > pi)
+            d_phi -= twopi;
+          else if (d_phi < -pi)
+            d_phi += twopi;
+          // Quadrants match HGCalCLUEAlgo (dIPhi = phi_j - phi_i, dIEta = eta_j - eta_i);
+          // cells on an axis (d==0) contribute to both adjacent quadrants.
+          if (d_phi >= TData{0} && d_eta >= TData{0})
+            quads[0] += c;
+          if (d_phi <= TData{0} && d_eta >= TData{0})
+            quads[1] += c;
+          if (d_phi >= TData{0} && d_eta <= TData{0})
+            quads[2] += c;
+          if (d_phi <= TData{0} && d_eta <= TData{0})
+            quads[3] += c;
+        }
+      }
+      return;
+    } else {
+      for (auto i = search_box[search_box.size() - N_][0];
+           i <= search_box[search_box.size() - N_][1];
+           ++i) {
+        base_vec[Ndim - N_] = i;
+        for_recursion_2x2<TAcc, Ndim, N_ - 1>(acc,
+                                              base_vec,
+                                              search_box,
+                                              tiles,
+                                              dev_points,
+                                              kernel,
+                                              coords_i,
+                                              quads,
+                                              density_radius,
+                                              metric,
+                                              point_id,
+                                              event);
+      }
+    }
+  }
+
   struct KernelCalculateLocalDensity {
     template <typename TAcc,
               std::size_t Ndim,
@@ -121,17 +213,34 @@ namespace clue::detail {
         dev_tiles.searchBox(searchbox_extremes, searchbox_bins);
 
         std::array<int32_t, Ndim> base_vec;
-        for_recursion<TAcc, Ndim, Ndim>(acc,
-                                        base_vec,
-                                        searchbox_bins,
-                                        dev_tiles,
-                                        dev_points,
-                                        kernel,
-                                        coords_i,
-                                        rho_i,
-                                        density_radius,
-                                        metric,
-                                        i);
+        if constexpr (clue::is_window2x2_kernel<std::remove_cvref_t<KernelType>>) {
+          std::array<TData, 4> quads{TData{0}, TData{0}, TData{0}, TData{0}};
+          for_recursion_2x2<TAcc, Ndim, Ndim>(acc,
+                                              base_vec,
+                                              searchbox_bins,
+                                              dev_tiles,
+                                              dev_points,
+                                              kernel,
+                                              coords_i,
+                                              quads,
+                                              density_radius,
+                                              metric,
+                                              i);
+          const auto nmax = math::max(math::max(quads[0], quads[1]), math::max(quads[2], quads[3]));
+          rho_i = dev_points.weights()[i] + nmax;
+        } else {
+          for_recursion<TAcc, Ndim, Ndim>(acc,
+                                          base_vec,
+                                          searchbox_bins,
+                                          dev_tiles,
+                                          dev_points,
+                                          kernel,
+                                          coords_i,
+                                          rho_i,
+                                          density_radius,
+                                          metric,
+                                          i);
+        }
 
         assert(rho_i >= TData{0});
         dev_points.rho()[i] = rho_i;
