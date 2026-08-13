@@ -189,7 +189,11 @@ namespace clue::detail {
           }();
           assert(distance >= TData{0});
 
-          if (distance <= effective_distance && distance < delta_i) {
+          if (distance <= effective_distance &&
+              ((distance < delta_i) ||
+               ((distance == delta_i) && (nh_i >= 0) &&
+                ((rho_j > points.rho()[nh_i]) ||
+                 ((rho_j == points.rho()[nh_i]) && (tag(j) > tag(nh_i))))))) {
             delta_i = distance;
             nh_i = j;
           }
